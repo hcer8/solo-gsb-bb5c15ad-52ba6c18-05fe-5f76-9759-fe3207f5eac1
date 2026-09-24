@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）、**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）、**跨设备窗口检索**（按时间范围、状态与设备标签精确筛选，绑定筛选条件的稳定游标分页）、**设备级高值告警**（触发/恢复双阈值滞回状态机，事件写入驱动状态转换，规则与状态持久化，批次重试不重复产生状态变化）与**设备缺报区间查询**（按窗口空隙计算连续缺报段，水位线未越过封存条件的窗口不报缺，迟到填空后自动缩短/拆分，纯只读）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）、**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）、**跨设备窗口检索**（按时间范围、状态与设备标签精确筛选，绑定筛选条件的稳定游标分页）、**设备级高值告警**（触发/恢复双阈值滞回状态机，事件写入驱动状态转换，规则与状态持久化，批次重试不重复产生状态变化）、**设备缺报区间查询**（按窗口空隙计算连续缺报段，水位线未越过封存条件的窗口不报缺，迟到填空后自动缩短/拆分，纯只读）与**设备每日同窗基线偏移查询**（按 UTC 每天相同窗位回看已封存窗口均值，以中位数/MAD 计算目标窗口偏移分数，缺失或未封存样本不用临近窗口代替，MAD 为零时同值记零、异值判越界，纯只读、迟到修正后实时反映）。
 
 ## 核心语义
 
@@ -81,6 +81,21 @@
   - `windows` 表中没有该位置的窗口记录（已有记录的位置无论 open/sealed 都不算缺）。
 - **按空隙计算**：实现只读取查询范围内的现存窗口记录，用相邻窗口之间的空隙宽度除以窗口大小得到缺失窗口数，**不逐窗遍历整个时间跨度**，大范围查询代价与范围内现存窗口数成正比。
 - **迟到填空自动生效**：迟到事件首次落入空窗会新建（并封存）该窗口记录，后续查询立即按最新空隙**缩短或拆分**缺报段；接口纯只读，不追改任何已有聚合。
+
+### 设备每日同窗基线偏移查询（只读）
+
+- **接口**：`GET /devices/{id}/daily-baseline?window_start=...&days=7&threshold=3.5`
+  - `window_start`（必填）：目标窗口起始时间（ISO 8601，UTC），必须是设备窗口网格上的窗口起点；
+  - `days`（必填）：回看天数，范围 **3..30**（越界 `422`）。从目标窗口起按 **UTC 每天相同窗位**回看，即考察 `window_start - k*86400`（`k=1..days`）上的窗口；
+  - `threshold`（必填）：**正数**偏移阈值（`<= 0` 返回 `422`），偏移分数**严格大于**该值判为越界。
+- **前置条件**：仅当**目标窗口已封存**且**窗口秒数可整除一天**（`86400 % window_size_seconds == 0`，如 60s、900s、86400s）时才计算——窗口大小不能整除一天时，每天相同 UTC 窗位无法在窗口网格上稳定复现，返回 `422`。设备不存在或目标窗口从无数据返回 `404`；目标窗口仍 `open` 返回 `409`。
+- **只认真实同窗位样本**：回看窗位中只有**已封存**窗口的事件均值（avg，含迟到修正）纳入基线；该位置**从无窗口（missing）或仍 open 的样本一律跳过**，响应的 `samples` 中按 `offset_days=1..days` 原样列出其状态，**绝不用临近窗口代替缺失或未封存样本**。
+- **偏移打分**：以有效样本均值的**中位数**与 **MAD（绝对偏差中位数）** 为稳健基线，`offset_score = |target_avg - baseline_median| / MAD`，`offset_score > threshold` 时 `outlier=true`。有效样本**不足 3 个**时返回 `status=insufficient_samples`，`baseline_median`/`mad`/`offset_score`/`outlier` 均为 `null`，不做越界判断。
+- **MAD 为 0 的退化情形**：超过半数历史样本均值相同时 MAD=0，除以 0 无定义：
+  - 目标均值**等于**基线中位数（同值偏移）：`offset_score=0.0`、`outlier=false`；
+  - 目标均值**不等于**基线中位数（异值偏移）：`offset_score=null` 且**直接标记越界** `outlier=true`（阈值再大也越界）。
+- **迟到修正实时生效**：接口纯只读且每次实时读取窗口聚合。迟到事件修正目标窗口（`target_avg` 变化）或任一历史同窗窗口（基线中位数/MAD 变化）后，**再次查询立即反映最新聚合值**。
+- **响应字段**：`status`（`ok`/`insufficient_samples`）、`sample_count`（有效样本数）、`required_samples`（=3）、`target_avg`、`baseline_median`、`mad`、`offset_score`、`outlier` 以及全部回看位置的 `samples` 明细（每项含 `offset_days`、`window_start`/`window_end`、`status`=`sealed`/`open`/`missing`、`included`、`avg`）。
 
 ## 启动
 
@@ -636,6 +651,47 @@ curl 'http://localhost:8000/devices/sensor-001/missing-windows?start=2026-09-22T
 - 只统计设备最早有数据窗口的**下一个窗口**起、且水位线已越过封存条件的空窗；未封存窗口不报缺。
 - 迟到事件首次填入空窗后，再次查询会自动缩短或拆分缺报段（上例若 `10:02` 被迟到事件填入，则该段缩短为 `[10:01, 10:02)` 一段）；接口纯只读，不改动任何聚合。
 
+### 19. 每日同窗基线偏移查询
+
+下例设备窗口为 60s（可整除一天）。前 3 天 UTC `00:00` 同窗位的已封存窗口均值分别为 10、11、12（基线中位数 11、MAD 1），目标窗口（2026-09-20 `[00:00, 00:01)`）均值 15：
+
+```bash
+curl 'http://localhost:8000/devices/sensor-001/daily-baseline?window_start=2026-09-20T00:00:00Z&days=7&threshold=3.5'
+```
+
+```json
+{
+  "device_id": "sensor-001",
+  "window_start": "2026-09-20T00:00:00Z",
+  "window_end": "2026-09-20T00:01:00Z",
+  "days": 7,
+  "threshold": 3.5,
+  "status": "ok",
+  "sample_count": 3,
+  "required_samples": 3,
+  "target_avg": 15.0,
+  "baseline_median": 11.0,
+  "mad": 1.0,
+  "offset_score": 4.0,
+  "outlier": true,
+  "samples": [
+    {"offset_days": 1, "window_start": "2026-09-19T00:00:00Z", "window_end": "2026-09-19T00:01:00Z", "status": "sealed", "included": true, "avg": 10.0},
+    {"offset_days": 2, "window_start": "2026-09-18T00:00:00Z", "window_end": "2026-09-18T00:01:00Z", "status": "sealed", "included": true, "avg": 11.0},
+    {"offset_days": 3, "window_start": "2026-09-17T00:00:00Z", "window_end": "2026-09-17T00:01:00Z", "status": "sealed", "included": true, "avg": 12.0},
+    {"offset_days": 4, "window_start": "2026-09-16T00:00:00Z", "window_end": "2026-09-16T00:01:00Z", "status": "missing", "included": false, "avg": null},
+    {"offset_days": 5, "window_start": "2026-09-15T00:00:00Z", "window_end": "2026-09-15T00:01:00Z", "status": "missing", "included": false, "avg": null},
+    {"offset_days": 6, "window_start": "2026-09-14T00:00:00Z", "window_end": "2026-09-14T00:01:00Z", "status": "missing", "included": false, "avg": null},
+    {"offset_days": 7, "window_start": "2026-09-13T00:00:00Z", "window_end": "2026-09-13T00:01:00Z", "status": "missing", "included": false, "avg": null}
+  ]
+}
+```
+
+- `offset_score = |target_avg - baseline_median| / MAD = |15-11|/1 = 4.0 > 3.5`，故 `outlier=true`；分数恰好等于阈值时不越界（严格大于）。
+- 已封存样本不足 3 个（如某些天 `missing` 或 `open`）时 `status=insufficient_samples`，不给出基线与越界判断；缺失位置不会用相邻时间的窗口顶替。
+- MAD 为 0 时：目标与基线同值记 `offset_score=0.0`/`outlier=false`；异值则 `offset_score=null`/`outlier=true`。
+- 目标窗口或历史同窗窗口随后收到迟到修正，重新调用本接口即返回最新聚合。
+- 设备不存在/目标窗口不存在返回 `404`，目标窗口未封存返回 `409`，窗口大小不能整除一天、`days` 越界（3..30）或 `threshold<=0` 返回 `422`。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -652,6 +708,7 @@ curl 'http://localhost:8000/devices/sensor-001/missing-windows?start=2026-09-22T
 | `GET` | `/windows/search` | 跨设备窗口检索：按时间范围（`start`/`end` 半开区间）、`status`、设备当前标签筛选，按 window_start、device_id 升序，绑定筛选条件的稳定游标分页（`limit`/`cursor`，非法或过期游标 400） |
 | `GET` | `/devices/{device_id}/anomalies?window_start=&threshold=3.5` | 已封存窗口事件的中位数/MAD 稳健异常检测（只读；窗口不存在 404，未封存 409，threshold≤0 为 422） |
 | `GET` | `/devices/{device_id}/missing-windows?start=&end=` | 连续缺报区间查询（只读；start/end 必填且对齐窗口大小，未对齐或 end≤start 为 422，设备不存在 404，无数据返回空列表） |
+| `GET` | `/devices/{device_id}/daily-baseline?window_start=&days=&threshold=` | 每日 UTC 同窗基线偏移查询（只读；days 3..30、threshold>0，窗口秒数须整除一天，目标窗须已封存；中位数/MAD 打分，样本不足 3 个返回 insufficient_samples，MAD=0 同值记零/异值 null 且越界；404/409/422） |
 | `PUT` | `/devices/{device_id}/alert-rule` | 设置/替换高值告警双阈值（trigger 必须严格高于 recovery，均为有限数；非法 400 且旧规则保留，设备不存在 404） |
 | `GET` | `/devices/{device_id}/alert` | 查询当前告警状态与生效规则（无规则 404；状态持久化、重启不丢） |
 | `POST` | `/groups` | 创建设备组（固定成员、sum/avg、窗口配置一致校验） |
@@ -666,7 +723,7 @@ curl 'http://localhost:8000/devices/sensor-001/missing-windows?start=2026-09-22T
 
 ```
 app/
-  main.py        # FastAPI 应用、遥测聚合、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）、设备级高值告警（双阈值滞回状态机）、设备缺报区间查询逻辑
+  main.py        # FastAPI 应用、遥测聚合、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）、设备级高值告警（双阈值滞回状态机）、设备缺报区间查询、每日同窗基线偏移查询逻辑
   db.py          # SQLite 连接、建表（含标签表、append-only 审计表/触发器、告警规则/状态/转换流水表）、旧库迁移与事务会话
 tests/
   test_api.py       # 端到端测试（水位线/封存/去重/迟到修正/持久化）
@@ -677,6 +734,7 @@ tests/
   test_windows_search.py # 跨设备窗口检索测试（时间范围/状态/标签筛选、游标分页稳定性、400/422、只读）
   test_alerts.py    # 设备级高值告警测试（滞回转换/边界取等、非法阈值不覆盖旧规则、重试幂等、迟到驱动、重启持久化、唯一约束兜底）
   test_missing_windows.py # 设备缺报区间查询测试（缺报段计算/封存条件裁剪/半开边界/迟到填空拆分/422/404/只读）
+  test_daily_baseline.py  # 每日同窗基线偏移查询测试（中位数/MAD 打分、样本不足、缺失/open 不替代、MAD=0 同值/异值、迟到修正实时反映、404/409/422、只读）
 Dockerfile
 docker-compose.yml
 requirements.txt
