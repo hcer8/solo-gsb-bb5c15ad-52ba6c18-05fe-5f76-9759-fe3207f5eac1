@@ -79,6 +79,20 @@
   且 windows 表中没有该位置的窗口记录。
 - 按现存窗口之间的空隙计算（空隙宽度 / 窗口大小 = 缺失窗口数），不逐窗遍历跨度；
   迟到事件首次填入空窗后新增窗口记录，后续查询自动缩短或拆分缺报段，不追改已有聚合。
+
+设备每日同窗基线偏移查询（只读）：
+- GET /devices/{device_id}/daily-baseline?window_start=&days=&threshold= 以目标窗口为基准，
+  按 UTC 每天同一窗位（window_start - k*86400, k=1..days）回看历史窗口，仅当对应窗口
+  存在且已封存（sealed，含迟到修正后的最新聚合）时计为有效样本；缺失或未封存位置一律跳过，
+  绝不用临近窗口代替。
+- 仅在目标窗口已封存、且窗口秒数可整除一天（86400 % window_size_seconds == 0，保证逐日同格）
+  时计算：窗口秒数不可整除返回 422，设备不存在返回 404，目标窗口不存在返回 404、未封存返回 409。
+- 基线取有效窗口均值的中位数与 MAD（绝对偏差中位数，不做 0.6745 归一化），偏移分数
+  score = |目标均值 - 中位数| / MAD，score > threshold 判越界；days 取 3..30、threshold 必须 > 0。
+- 有效样本不足 3 个时返回 status=insufficient_samples（不计算分数、不判越界，breached=null）。
+- MAD 为 0 时：目标均值等于中位数（同值偏移）记 score=0、breached=false；异值偏移除以 0 无定义，
+  score 返回 null 并标记 breached=true。
+- 迟到修正原位更新窗口聚合，再次查询立即反映最新的 count/sum/avg；接口纯只读。
 """
 
 from __future__ import annotations
@@ -122,11 +136,16 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.7.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.8.0", lifespan=lifespan)
 
 # 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
 DEFAULT_ANOMALY_THRESHOLD = 3.5
 MAD_NORMALIZER = 0.6745
+# 每日同窗基线偏移：UTC 一天秒数、回看天数范围与最少有效样本数
+SECONDS_PER_DAY = 86400
+MIN_BASELINE_DAYS = 3
+MAX_BASELINE_DAYS = 30
+MIN_BASELINE_SAMPLES = 3
 
 
 # ---------- Pydantic 模型 ----------
@@ -236,6 +255,36 @@ class AnomalyOut(BaseModel):
     value: float
     # 修正 z 分数；MAD 为 0 时分数无定义（除以 0），非中位值一律判为异常，score 返回 null
     score: Optional[float] = None
+
+
+class DailyBaselineSampleOut(BaseModel):
+    # 一个有效回看样本：目标窗位往前第 offset_days 天的同窗已封存窗口均值
+    window_start: datetime
+    window_end: datetime
+    offset_days: int
+    avg: float
+
+
+class DailyBaselineOut(BaseModel):
+    device_id: str
+    window_start: datetime
+    window_end: datetime
+    days: int
+    # ok：样本充足且完成打分；insufficient_samples：有效样本不足 3 个（不判越界）
+    status: Literal["ok", "insufficient_samples"]
+    sample_count: int
+    samples: list[DailyBaselineSampleOut]  # 按 window_start 升序（仅含有效样本）
+    target_avg: Optional[float] = None      # 目标窗口均值（窗口至少含 1 个事件）
+    # 基线：有效窗口均值的中位数与 MAD（样本不足时为 null）
+    baseline_median: Optional[float] = None
+    baseline_mad: Optional[float] = None
+    # |目标均值 - 中位数|；样本不足时为 null
+    deviation: Optional[float] = None
+    # 偏移分数 = deviation / MAD；MAD=0 且异值偏移时除以 0 无定义，返回 null
+    score: Optional[float] = None
+    threshold: float
+    # 越界判定；样本不足（无法判定）时为 null
+    breached: Optional[bool] = None
 
 
 class GroupCreate(BaseModel):
@@ -1572,6 +1621,123 @@ def list_device_anomalies(
                     score=score,
                 ))
         return anomalies
+
+
+# ---------- 设备每日同窗基线偏移查询接口 ----------
+
+@app.get("/devices/{device_id}/daily-baseline", response_model=DailyBaselineOut)
+def get_device_daily_baseline(
+    device_id: str,
+    window_start: datetime = Query(..., description="目标窗口起始时间（ISO 8601），按设备窗口大小对齐"),
+    days: int = Query(..., ge=MIN_BASELINE_DAYS, le=MAX_BASELINE_DAYS, description="按 UTC 逐日回看天数（3..30）"),
+    threshold: float = Query(..., gt=0, description="正数越界阈值，score 严格大于该值判越界"),
+) -> DailyBaselineOut:
+    """查询目标窗口相对其按 UTC 每天相同窗位的历史基线的偏移（只读）。
+
+    前置条件：设备窗口秒数必须可整除一天（86400 % window_size_seconds == 0），
+    否则"每天同一窗位"无法逐日对齐，返回 422；目标窗口不存在返回 404、
+    尚未封存（open）返回 409；设备不存在返回 404。
+
+    样本采集：取 window_start - k*86400（k=1..days）各天同一窗位的历史窗口，
+    仅当窗口存在且**已封存**（含迟到修正后的最新聚合）时作为有效样本，
+    缺失或仍 open 的位置一律跳过，绝不用临近窗口代替。
+
+    打分：基线中位数/MAD 取有效窗口均值（无 0.6745 归一化），
+    score = |目标均值 - 中位数| / MAD，score > threshold 判越界。
+    有效样本不足 3 个返回 status=insufficient_samples（score 与 breached 均为 null）。
+    MAD=0 时，目标均值与中位数同值记 score=0、不越界；异值偏移分数无定义（null）并判越界。
+    迟到修正原位更新窗口聚合，再次查询立即反映最新值。
+    """
+    w_start = to_epoch(window_start)
+    with db.session() as conn:
+        dev = require_device(conn, device_id)
+        size = dev["window_size_seconds"]
+
+        if SECONDS_PER_DAY % size != 0:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"window size {size}s must divide one day ({SECONDS_PER_DAY}s) exactly"
+                    " so that the same window position lines up across UTC days"
+                ),
+            )
+
+        target = conn.execute(
+            "SELECT * FROM windows WHERE device_id = ? AND window_start = ?",
+            (device_id, w_start),
+        ).fetchone()
+        if target is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"window not found for device {device_id} at window_start {window_start.isoformat()}",
+            )
+        if target["status"] != "sealed":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"window at {window_start.isoformat()} is not sealed; "
+                    "daily-baseline comparison is only available on sealed windows"
+                ),
+            )
+
+        target_avg = target["sum"] / target["count"] if target["count"] else None
+
+        # 逐日采集同格已封存窗口；缺失/未封存位置跳过（绝不以临近窗口代替）。
+        # 天数上限 30，逐日点查代价有界。
+        sample_rows: list[sqlite3.Row] = []
+        for k in range(1, days + 1):
+            hist_start = w_start - k * SECONDS_PER_DAY
+            row = conn.execute(
+                "SELECT * FROM windows WHERE device_id = ? AND window_start = ?",
+                (device_id, hist_start),
+            ).fetchone()
+            if row is not None and row["status"] == "sealed" and row["count"] > 0:
+                sample_rows.append(row)
+        sample_rows.sort(key=lambda r: r["window_start"])
+
+        samples = [
+            DailyBaselineSampleOut(
+                window_start=to_iso(r["window_start"]),
+                window_end=to_iso(r["window_end"]),
+                offset_days=int(round((w_start - r["window_start"]) / SECONDS_PER_DAY)),
+                avg=r["sum"] / r["count"],
+            )
+            for r in sample_rows
+        ]
+
+        result = DailyBaselineOut(
+            device_id=device_id,
+            window_start=to_iso(w_start),
+            window_end=to_iso(w_start + size),
+            days=days,
+            status="insufficient_samples" if len(samples) < MIN_BASELINE_SAMPLES else "ok",
+            sample_count=len(samples),
+            samples=samples,
+            target_avg=target_avg,
+            threshold=threshold,
+        )
+        if len(samples) < MIN_BASELINE_SAMPLES:
+            # 有效样本不足：不计算基线、不判越界
+            return result
+
+        avgs = [s.avg for s in samples]
+        median = _median(avgs)
+        mad = _median([abs(v - median) for v in avgs])
+        deviation = abs(target_avg - median) if target_avg is not None else None
+        result.baseline_median = median
+        result.baseline_mad = mad
+        result.deviation = deviation
+
+        if mad == 0.0:
+            # MAD 为 0：同值偏移记零、不越界；异值偏移除以 0 无定义，score=null 并判越界。
+            # 均值经 sum/count 得到，数学同值可能残留极小浮点误差，用容差判定"同值"。
+            same_value = math.isclose(deviation, 0.0, rel_tol=1e-9, abs_tol=1e-12) if deviation is not None else False
+            result.score = 0.0 if same_value else None
+            result.breached = not same_value
+        else:
+            result.score = deviation / mad
+            result.breached = result.score > threshold
+        return result
 
 
 # ---------- 设备级高值告警接口 ----------
